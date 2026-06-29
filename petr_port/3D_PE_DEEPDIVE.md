@@ -34,6 +34,25 @@ Code entry point — one function:
 
 ## 2. Step 1 — the 3D Coordinates Generator (a camera frustum in 3D)
 
+> **See it first:** `python3 study/visualize_frustum.py --index 0`
+> → `work_dirs/study/frustum_bev_0.jpg`.
+
+**The intuition (this is the whole confusing part):**
+- A 2D pixel is **not** a 3D point — it's a **ray** (a line of sight). You know
+  the *direction* but not *how far*.
+- PETR doesn't *predict* the distance; it **samples** it — it picks `D=64`
+  candidate depths along the ray. So **one pixel → 64 candidate 3D points** (a
+  "ray of points").
+- Do that for every pixel of a camera and you get a **frustum** — a fan/cone of
+  3D points, narrow near the lens, spreading out far away (the *right* panel of
+  the figure shows one camera's fan, coloured by depth).
+- Convert each `(pixel, depth)` into `(x,y,z)` in the shared **LiDAR** frame, and
+  now **all 6 cameras' frustums live in one common 3D space** and tile 360°
+  around the car (the *left* panel). That shared frame is what lets a query
+  (a 3D point) talk to keys from any camera.
+
+Concretely:
+
 For every camera and every feature-map cell `(H=20, W=50)`, PETR builds a
 **frustum of 3D points** by sampling `D=64` depths along the pixel ray and
 back-projecting them into the **LiDAR** frame.
