@@ -126,6 +126,58 @@ that's why plain dot-product attention can match a query to its object's tokens.
 
 ---
 
+## 3b. Common confusion: "image space" vs "3D space"
+
+A natural question while reading this code:
+
+> *"Sine PE happens in image space, and the 3D PE is the 3D discretized points
+> projected to image space, then embedded, then added to the 2D sine PE — and
+> the sum is the key position?"*
+
+Almost — **one arrow is backwards**. What's right and what to fix:
+
+- ✅ **Sine PE is image space** — `SinePositionalEncoding3D` encodes *(which
+  camera, row, column)* on the feature grid.
+- ✅ **The sum is the key position** — `pos_embed = 3D PE + sine PE` is the
+  `key_pos` fed to cross-attention.
+- ❌ **Direction:** the geometry runs **image → 3D (back-projection)**, *not*
+  3D → image. Pixels are **un-projected** into 3D, not 3D points projected onto
+  the image.
+
+**What actually happens**, per feature cell `(u, v)` on the `20×50` grid:
+1. sample **64 depths** `d` (LID),
+2. form homogeneous image points `(u·d, v·d, d, 1)`,
+3. multiply by **`img2lidar = inv(lidar2img)`** → 64 real **3D points in the
+   LiDAR frame** (the ray / frustum),
+4. normalize those `(x, y, z)` and run the `position_encoder` MLP → a 256-d
+   vector.
+
+So it's *"image pixel + depths → back-projected to 3D coordinates → embed those
+3D coordinates,"* not *"3D points projected onto the image."*
+
+**The reconciliation (the real source of confusion):** both PEs are stored on
+the **same image grid** `[B, N, 256, H, W]` — that's *why* they can be summed —
+but they **encode different things**:
+
+| | layout (where it is stored) | value (what it encodes) |
+|---|---|---|
+| **sine PE** | per image cell `[H, W]` | "I am pixel (row, col) of camera n" — image/view identity |
+| **3D PE** | per image cell `[H, W]` | "my pixel's ray passes through these 3D coordinates" — LiDAR-space geometry |
+
+The 3D PE is therefore **indexed by image location but valued by 3D position** —
+it attaches a *3D meaning* to each *image token*.
+
+```
+image cell (u,v) --+64 depths--> back-project (inv lidar2img) --> 3D coords --MLP--> 3D PE  ┐
+                                                                                           ├ add -> key_pos (1,6,256,20,50)
+camera n, row, col -----------------------------------------> sine PE --adapt_pos3d-->      ┘
+```
+
+To *see* the back-projection literally, run `study/visualize_frustum.py` — those
+fanned-out 3D points are exactly the `coords3d` that get embedded into the 3D PE.
+
+---
+
 ## 4. Reproducing Figure 4 — "3D PE similarity"
 
 Paper (Sec. 3.3): *“we randomly select the PE at three points in the front view
@@ -156,6 +208,54 @@ real model:
 That cross-view bleed is the proof: two pixels in *different* cameras that look
 at the *same 3D region* get *similar* 3D PE. Attention can therefore associate
 them for free.
+
+### Why the heatmap lights up other views — the geometry
+
+The cosine heatmap is the *measurement*; the tail of
+[`study/visualize_3d_pe.py`](study/visualize_3d_pe.py) prints the *cause*. It
+back-projects the CENTER front point and shows that the 3D PE of one pixel is
+really the embedding of a **ray**, not a single point:
+
+```python
+l2i       = img_metas[0]["lidar2img"][FRONT]     # 3D -> image (4x4)
+img2lidar = np.linalg.inv(l2i)                   # image -> 3D
+u, v      = cols[1]*16 + 8, r*16 + 8             # feature cell -> 800x320 pixel
+for d in (3.0, 15.0, 45.0):                      # sweep depth along the ray
+    p = img2lidar @ np.array([u*d, v*d, d, 1.0])
+    p = p[:3] / p[3]
+```
+
+**The math.** Forward, `lidar2img` sends a LiDAR point to *homogeneous* image
+coordinates $(u z,\, v z,\, z,\, 1)$ — the pixel scaled by its depth $z$. A
+single pixel can't be inverted (the depth was multiplied away), so you **pick** a
+depth $d$, rebuild the homogeneous vector, invert, and divide by the homogeneous
+coordinate $w$:
+
+$$ \mathbf{p}^{\text{lidar}}(d) = \text{lidar2img}^{-1}\,(u\,d,\; v\,d,\; d,\; 1)^\top \;\;\xrightarrow{\;/\,w\;}\;\; (x, y, z) $$
+
+Sweeping $d = 3 \to 15 \to 45\,\text{m}$ marches the point **outward along one
+straight line of sight** — the pixel's ray. (`*16+8` first turns the feature
+cell back into an 800×320 input pixel: the feature map has stride 16, and `+8`
+hits the cell centre.)
+
+**Why other views light up.** PETR's 3D PE for a pixel encodes that *whole ray*
+(Section 2: 64 depths → 64 points → MLP). Take any other camera with an
+overlapping field of view: some of its pixels look at the **same stretch of 3D
+space** the front ray passes through, so *their* rays intersect the front ray's
+points. Same 3D position → same 3D-coordinate input to the encoder → **similar
+256-d PE** → high cosine → a **warm blob in that neighbour view**. Cameras that
+never see that region (the rear three) get near-orthogonal PE and stay cold.
+
+**Why the side matches.** The lateral sign of $\mathbf{p}^{\text{lidar}}$ follows
+the pixel's column — the LEFT front pixel back-projects to one side, the RIGHT to
+the other (the script's printed `xyz` confirms the sign). The overlapping camera
+on that side is the one whose FOV contains those 3D points, which is exactly why
+**LEFT point → FRONT_LEFT bleed** and **RIGHT point → FRONT_RIGHT bleed**, never
+the reverse.
+
+In one line: *back-projection shows each pixel's PE is a 3D ray; wherever another
+camera's pixels sit on that ray their PE matches — and that match **is** the
+cross-view heatmap.*
 
 > Knobs: `--index N` (different scene), `--row-frac` (move the 3 points up/down).
 > Try a back-row scene to see BACK cameras light up instead.

@@ -283,7 +283,11 @@ def main():
     ap.add_argument("--out-dir", default=os.path.join(
         compat.REPO_ROOT, "work_dirs/petr_vov_mini"))
     ap.add_argument("--limit", type=int, default=0,
-                    help="evaluate only the first N samples (0 = all)")
+                    help="run inference on only the first N samples (0 = all). "
+                         "A partial run auto-skips the official eval, which "
+                         "needs the whole mini_val split.")
+    ap.add_argument("--no-eval", action="store_true",
+                    help="write detections but skip the official nuScenes eval")
     args = ap.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -294,8 +298,10 @@ def main():
 
     infos = mmengine.load(os.path.join(args.data_root,
                                        "nuscenes_infos_val.pkl"))["infos"]
+    full_count = len(infos)
     if args.limit:
         infos = infos[:args.limit]
+    partial = len(infos) < full_count
     print(f"Running inference on {len(infos)} samples ...")
 
     eval_cfg = config_factory("detection_cvpr_2019")
@@ -319,6 +325,17 @@ def main():
     res_path = os.path.join(args.out_dir, "results_nusc.json")
     mmengine.dump(submission, res_path)
     print("Wrote", res_path)
+
+    # The official nuScenes eval requires predictions for EVERY sample in the
+    # mini_val split, so skip it for partial (--limit) or explicit --no-eval.
+    if args.no_eval or partial:
+        reason = "--no-eval" if args.no_eval else \
+            f"partial run ({len(infos)}/{full_count} samples)"
+        print(f"\nSkipping official nuScenes evaluation ({reason}).")
+        print(f"Detections were written to {res_path}.")
+        print(f"For the full mAP / NDS, run all {full_count} samples: "
+              f"python3 petr_infer.py   (no --limit / --no-eval).")
+        return
 
     # ---- official nuScenes evaluation ----
     from nuscenes import NuScenes
