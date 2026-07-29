@@ -15,7 +15,7 @@ It saves a checkpoint at the end. This is a SMOKE/LEARNING job to see real
 training step on this stack -- not a full training run (no multi-GPU dataloader,
 no full augmentation pipeline / LR schedule; see TRAINING_GUIDE.md).
 
-Run:  python3 study/train_tiny.py --steps 20 --num-samples 3
+Run:  python3 study/train_tiny.py --steps 5 --num-samples 2
 """
 import argparse
 import os
@@ -29,13 +29,38 @@ import mmengine  # noqa: E402
 from mmdet.registry import MODELS  # noqa: E402
 import petr_infer as P  # noqa: E402
 from study.loss_demo import TRAIN_CFG, build_gt  # noqa: E402
+from projects.mmdet3d_plugin.core.bbox.util import normalize_bbox  # noqa: E402
+
+
+def print_gt_encoding(gt_box):
+    """Show the exact 9D nuScenes box -> 10D PETR loss-target conversion."""
+    if len(gt_box) == 0:
+        print("GT encoding example: this sample has no valid boxes.")
+        return
+
+    # This is the same conversion PETRHead.loss() performs before loss_single().
+    gt_for_loss = torch.cat(
+        (gt_box.gravity_center, gt_box.tensor[:, 3:]), dim=1)
+    encoded = normalize_bbox(gt_for_loss, P.POINT_CLOUD_RANGE)
+    raw = gt_for_loss[0].detach().cpu().tolist()
+    target = encoded[0].detach().cpu().tolist()
+    print("\nGT conversion example (first valid box):")
+    print("  input  [cx, cy, cz, w, l, h, yaw, vx, vy]")
+    print("        ", [round(v, 4) for v in raw])
+    print("  target [cx, cy, log(w), log(l), cz, log(h), "
+          "sin(yaw), cos(yaw), vx, vy]")
+    print("        ", [round(v, 4) for v in target])
+    print("  source: projects/mmdet3d_plugin/core/bbox/util.py::normalize_bbox")
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--steps", type=int, default=20)
-    ap.add_argument("--num-samples", type=int, default=3)
+    ap.add_argument("--steps", type=int, default=5)
+    ap.add_argument("--num-samples", type=int, default=2)
     ap.add_argument("--lr", type=float, default=2e-4)
+    ap.add_argument("--split", choices=("train", "val"), default="train")
+    ap.add_argument("--checkpoint", default=os.path.join(
+        compat.REPO_ROOT, "ckpts/petr_vovnet_p4_800x320.pth"))
     ap.add_argument("--out", default=os.path.join(
         compat.REPO_ROOT, "work_dirs/tiny_train"))
     args = ap.parse_args()
@@ -49,9 +74,7 @@ def main():
     import projects.mmdet3d_plugin.core.bbox.assigners.hungarian_assigner_3d  # noqa
     model = MODELS.build(P.build_model_cfg(train_cfg=TRAIN_CFG)).to(device)
     from mmengine.runner import load_checkpoint
-    load_checkpoint(model, os.path.join(
-        compat.REPO_ROOT, "ckpts/petr_vovnet_p4_800x320.pth"),
-        map_location="cpu", strict=True)
+    load_checkpoint(model, args.checkpoint, map_location="cpu", strict=True)
     model.train()
 
     # --- optimiser: backbone at 0.1x LR (config's paramwise_cfg) ---
@@ -66,14 +89,23 @@ def main():
          dict(params=other_params, lr=args.lr)], weight_decay=0.01)
 
     # --- a few samples (test-time preprocessing; GT from info pkl) ---
-    infos = mmengine.load(
-        os.path.join(data_root, "nuscenes_infos_val.pkl"))["infos"]
+    info_path = os.path.join(
+        data_root, f"nuscenes_infos_{args.split}.pkl")
+    infos = mmengine.load(info_path)["infos"]
+    if args.num_samples < 1:
+        raise ValueError("--num-samples must be at least 1")
+    if args.num_samples > len(infos):
+        raise ValueError(
+            f"requested {args.num_samples} samples, but {info_path} has "
+            f"only {len(infos)}")
     samples = []
     for i in range(args.num_samples):
         img, metas = P.preprocess_sample(infos[i], data_root)
         gt_box, gt_labels = build_gt(infos[i], device)
         samples.append((img, metas, gt_box, gt_labels))
-    print(f"tiny training: {args.num_samples} samples, {args.steps} steps, "
+        print_gt_encoding(samples[0][2])
+        print(f"\ntiny training: split={args.split}, {args.num_samples} samples, "
+                    f"{args.steps} steps, "
           f"FP32, lr={args.lr} (backbone {args.lr*0.1})")
     print(f"{'step':>5} {'total':>9} {'loss_cls':>9} {'loss_bbox':>9} {'gnorm':>8}")
 
@@ -87,8 +119,10 @@ def main():
         loss.backward()
         gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), 35)
         optimizer.step()
-        print(f"{step:5d} {float(loss):9.4f} {float(losses['loss_cls']):9.4f} "
-              f"{float(losses['loss_bbox']):9.4f} {float(gnorm):8.2f}")
+          print(f"{step:5d} {loss.detach().item():9.4f} "
+              f"{losses['loss_cls'].detach().item():9.4f} "
+              f"{losses['loss_bbox'].detach().item():9.4f} "
+              f"{gnorm.detach().item():8.2f}")
 
     ckpt_path = os.path.join(args.out, "tiny_petr.pth")
     torch.save({"state_dict": model.state_dict(),

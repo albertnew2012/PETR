@@ -95,6 +95,39 @@ token.**
 Finally the coords are normalised to `[0,1]` by `position_range` and points
 outside the volume are masked (`coords_mask`).
 
+> **Why back-project at all? (common confusion)**
+>
+> The 64 points *are* specific to feature cell `(i,j)` — that part of your
+> intuition is right. The catch is **which coordinate frame they live in**.
+> Before back-projection each point is `(u·d, v·d, d)` — that's **image space**
+> (a pixel index plus a depth), which is (a) not a real metric 3D location and
+> (b) meaningful only for *that one camera*. `lidar2img` is the matrix that maps
+> a real 3D point in the shared **LiDAR** frame to that camera's pixel:
+>
+> $$ (u\,d,\; v\,d,\; d,\; 1)^\top = \text{lidar2img}\,(x,y,z,1)^\top_{\text{lidar}} $$
+>
+> We have the left side (pixel+depth) and want the right side (metric `xyz`), so
+> we invert it — `img2lidar = inv(lidar2img)`. Two reasons this is essential:
+>
+> 1. **Metric coordinates for the MLP.** "row 25, col 40, depth 15" is not a
+>    location the position-encoder MLP can encode; `(x=-0.3, y=15.5, z=-1.4) m`
+>    is. The MLP needs real 3D coordinates, not pixel indices.
+> 2. **One shared frame for all 6 cameras.** Each camera has its *own*
+>    `lidar2img` (its own pose + intrinsics). After back-projecting each
+>    camera's frustum with *its own* `inv(lidar2img)`, every camera's points land
+>    in the **same** LiDAR coordinate system:
+>
+> ```
+> CAM_FRONT  pixel → ray → inv(lidar2img_FRONT) → xyz ┐
+> CAM_BACK   pixel → ray → inv(lidar2img_BACK)  → xyz ├─ one shared 3D space
+> CAM_LEFT   pixel → ray → inv(lidar2img_LEFT)  → xyz ┘
+> ```
+>
+> That shared frame is the whole point: a pixel in CAM_FRONT_LEFT and a pixel in
+> CAM_FRONT that look at the **same physical 3D region** back-project to **nearby
+> `xyz` → similar 3D PE**, which is exactly the *"same-3D-region pixels in
+> different cameras ⇒ similar 3D PE ⇒ fusion"* result from Fig 4.
+
 ---
 
 ## 3. Step 2 — the 3D Position Encoder (an MLP over the ray)

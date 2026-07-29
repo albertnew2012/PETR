@@ -225,8 +225,50 @@ FP32 (the real FP16 path needs the mmcv `Fp16OptimizerHook` + `force_fp32`
 upcasting, which isn't ported). The loss drops e.g. `9.08 -> 5.17` in 10 steps,
 confirming end-to-end training works on this stack:
 ```bash
-python3 study/train_tiny.py --steps 20 --num-samples 3
+python3 study/train_tiny.py --steps 5 --num-samples 2 --split train
 ```
+
+The script also prints one real GT box before and after its conversion to the
+10-dimensional PETR loss target. Its tiny data flow is:
+
+```text
+nuscenes_infos_train.pkl (first two samples)
+  → six camera images + projection metadata
+  → VoVNet + CPFPN + PETR decoder
+  → 900 class and box predictions
+  → Hungarian one-to-one matching with GT
+  → focal classification + 10D L1 box losses from all six decoder layers
+  → backward + AdamW step + gradient clipping
+```
+
+### Exact GT-to-10D conversion locations
+
+The conversion is split across four locations:
+
+1. [`build_gt()` in `petr_port/study/loss_demo.py`](./study/loss_demo.py#L33-L62)
+  reads each info-pickle box as
+  `(cx,cy,cz,w,l,h,yaw)`, appends `(vx,vy)`, filters invalid classes/ranges,
+  and constructs a 9D `LiDARInstance3DBoxes` object. It temporarily converts
+  gravity-center $z$ to bottom-center $z$ because that box class stores bottom
+  centers.
+2. [`PETRHead.loss()`](../projects/mmdet3d_plugin/models/dense_heads/petr_head.py#L672-L675)
+  reads `.gravity_center` to recover `(cx,cy,cz)` and appends the remaining
+  `(w,l,h,yaw,vx,vy)` fields.
+3. [Hungarian target assignment](../projects/mmdet3d_plugin/models/dense_heads/petr_head.py#L489-L507)
+  assigns one GT box to each positive query and copies that 9D GT into
+  `bbox_targets`.
+4. [`normalize_bbox()`](../projects/mmdet3d_plugin/core/bbox/util.py#L38-L65),
+  called by [`loss_single()`](../projects/mmdet3d_plugin/models/dense_heads/petr_head.py#L618-L624),
+  performs the final conversion:
+
+```text
+input:  [cx, cy, cz, w, l, h, yaw, vx, vy] (9D)
+output: [cx, cy, log(w), log(l), cz, log(h), sin(yaw), cos(yaw), vx, vy] (10D)
+```
+
+More precisely, the 9D input order is
+`[cx,cy,cz,w,l,h,yaw,vx,vy]`. The output has ten values because one yaw scalar
+becomes two continuous values, `sin(yaw)` and `cos(yaw)`.
 
 > **VS Code debugging:** all of these (plus eval/build/gen-infos) are wired as
 > launch configs in [`.vscode/launch.json`](../.vscode/launch.json), each with

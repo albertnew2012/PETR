@@ -6,6 +6,8 @@ the original mmdet3d 0.17 nuScenes formatting / evaluation, on the modern stack.
 """
 import argparse
 import os
+import subprocess
+import sys
 
 import compat  # noqa: F401  (installs shims first)
 
@@ -288,6 +290,15 @@ def main():
                          "needs the whole mini_val split.")
     ap.add_argument("--no-eval", action="store_true",
                     help="write detections but skip the official nuScenes eval")
+    ap.add_argument(
+        "--blackout-cams", nargs="*", choices=CAMERAS, default=[],
+        help="camera slots to zero after preprocessing (keeps geometry/shape)")
+    ap.add_argument("--visualize", action="store_true",
+                    help="render sample 0 immediately after inference")
+    ap.add_argument("--visual-name", default="petr",
+                    help="unique visualization filename/model label")
+    ap.add_argument("--score-thr", type=float, default=0.5,
+                    help="visualization confidence threshold")
     args = ap.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -303,11 +314,18 @@ def main():
         infos = infos[:args.limit]
     partial = len(infos) < full_count
     print(f"Running inference on {len(infos)} samples ...")
+    blackout_indices = [CAMERAS.index(camera)
+                        for camera in args.blackout_cams]
+    if args.blackout_cams:
+        print("Zeroing camera tensors after preprocessing:",
+              ", ".join(args.blackout_cams))
 
     eval_cfg = config_factory("detection_cvpr_2019")
     nusc_annos = {}
     for idx, info in enumerate(mmcv.track_iter_progress(infos)):
         img, img_metas = preprocess_sample(info, args.data_root)
+        if blackout_indices:
+            img[:, blackout_indices] = 0.0
         img = img.to(device)
         with torch.no_grad():
             result = model.simple_test(img_metas, img)
@@ -325,6 +343,24 @@ def main():
     res_path = os.path.join(args.out_dir, "results_nusc.json")
     mmengine.dump(submission, res_path)
     print("Wrote", res_path)
+
+    if args.visualize:
+        visualizer = os.path.join(os.path.dirname(__file__),
+                                  "petrv2_visualize.py")
+        command = [
+            sys.executable, visualizer,
+            "--index", "0",
+            "--score-thr", str(args.score_thr),
+            "--gt",
+            "--model-name", args.visual_name,
+            "--output-name", f"{args.visual_name}_sample_0.jpg",
+            "--result-dir", args.out_dir,
+            "--data-root", args.data_root,
+        ]
+        if args.blackout_cams:
+            command.extend(["--blackout-cams", *args.blackout_cams])
+        print("Creating visualization ...")
+        subprocess.run(command, check=True)
 
     # The official nuScenes eval requires predictions for EVERY sample in the
     # mini_val split, so skip it for partial (--limit) or explicit --no-eval.
